@@ -4,17 +4,19 @@ import io
 import sys
 import time
 import json
+import math
 import hashlib
 import zipfile
 import threading
 import subprocess
+from statistics import median
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# Optional third-party libraries (verified installed)
+# Optional third-party libraries
 try:
     import pymupdf
 except ImportError:
@@ -36,9 +38,549 @@ except ImportError:
     pptx = None
 
 try:
-    from PIL import Image, ExifTags
+    from PIL import Image
 except ImportError:
     Image = None
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except ImportError:
+    RapidOCR = None
+
+
+# ==============================================================================
+# OCR ENGINE SINGLETON (THREAD-SAFE RAPIDOCR)
+# ==============================================================================
+
+_OCR_INSTANCE = None
+_OCR_LOCK = threading.Lock()
+
+
+def get_ocr_engine():
+    """Lazy thread-safe initialization of RapidOCR."""
+    global _OCR_INSTANCE
+    if RapidOCR is None:
+        return None
+    if _OCR_INSTANCE is None:
+        with _OCR_LOCK:
+            if _OCR_INSTANCE is None:
+                try:
+                    _OCR_INSTANCE = RapidOCR()
+                except Exception:
+                    _OCR_INSTANCE = None
+    return _OCR_INSTANCE
+
+
+# ==============================================================================
+# LATEX MATH & CLEAN TABLE FORMATTING UTILITIES
+# ==============================================================================
+
+UNICODE_TO_LATEX = {
+    "α": r"\alpha ", "β": r"\beta ", "γ": r"\gamma ", "δ": r"\delta ",
+    "ε": r"\varepsilon ", "ζ": r"\zeta ", "η": r"\eta ", "θ": r"\theta ",
+    "ι": r"\iota ", "κ": r"\kappa ", "λ": r"\lambda ", "μ": r"\mu ",
+    "ν": r"\nu ", "ξ": r"\xi ", "π": r"\pi ", "ρ": r"\rho ",
+    "σ": r"\sigma ", "τ": r"\tau ", "υ": r"\upsilon ", "φ": r"\varphi ",
+    "χ": r"\chi ", "ψ": r"\psi ", "ω": r"\omega ",
+    "Γ": r"\Gamma ", "Δ": r"\Delta ", "Θ": r"\Theta ", "Λ": r"\Lambda ",
+    "Ξ": r"\Xi ", "Π": r"\Pi ", "Σ": r"\Sigma ", "Φ": r"\Phi ",
+    "Ψ": r"\Psi ", "Ω": r"\Omega ",
+    "∑": r"\sum ", "∏": r"\prod ", "∫": r"\int ", "∮": r"\oint ",
+    "√": r"\sqrt", "∂": r"\partial ", "∇": r"\nabla ", "∞": r"\infty ",
+    "±": r"\pm ", "∓": r"\mp ", "×": r"\times ", "÷": r"\div ",
+    "≤": r"\leq ", "≥": r"\geq ", "≠": r"\neq ",
+    "≈": r"\approx ", "≡": r"\equiv ", "∝": r"\propto ", "∈": r"\in ",
+    "∉": r"\notin ", "⊂": r"\subset ", "⊆": r"\subseteq ", "∪": r"\cup ",
+    "∩": r"\cap ", "∀": r"\forall ", "∃": r"\exists ", "⇒": r"\Rightarrow ",
+    "⇔": r"\Leftrightarrow ", "→": r"\rightarrow ", "←": r"\leftarrow ",
+    "↔": r"\leftrightarrow ", "°": r"^{\circ}",
+    "²": r"^{2}", "³": r"^{3}", "¹": r"^{1}", "⁰": r"^{0}",
+    "⁴": r"^{4}", "⁵": r"^{5}", "⁶": r"^{6}", "⁷": r"^{7}", "⁸": r"^{8}", "⁹": r"^{9}",
+    "₀": r"_{0}", "₁": r"_{1}", "₂": r"_{2}", "₃": r"_{3}", "₄": r"_{4}",
+    "₅": r"_{5}", "₆": r"_{6}", "₇": r"_{7}", "₈": r"_{8}", "₉": r"_{9}",
+}
+
+MATH_SYMBOL_SET = set(UNICODE_TO_LATEX.keys())
+
+# Regex patterns to detect standalone equations or inline math expressions
+STANDALONE_EQ_RE = re.compile(
+    r"^\s*(?:[A-Za-z\d\)\]\s_^{}\\]+\s*(?:=|\\leq|\\geq|\\neq|\\approx|≤|≥|≠|≈)\s*[^=]{2,})"
+    r"|(?:\b(?:lim|sum|int|frac|sqrt)\b|\\(?:sum|int|frac|sqrt|partial|nabla|alpha|beta|gamma|sigma|Delta|Omega))"
+)
+
+INLINE_MATH_PATTERNS = [
+    # Variables with subscripts/superscripts or equations like R^2 = 0.98, x_1 + x_2 = y
+    re.compile(r"(?<!\$)\b([A-Za-z]\s*[\^_]\s*\{?[A-Za-z0-9+\-]+\}?(?:\s*(?:<=|>=|!=|[=<>≤≥≠≈+\-*/])\s*[A-Za-z0-9.\^_{}\\]+)*)(?!\$)"),
+    # Functional expressions like f(x) = 2x + 1
+    re.compile(r"(?<!\$)\b([fghFGH]\([A-Za-z,\s]+\)\s*=\s*[A-Za-z0-9+\-*/^_().\s]+)(?!\$)"),
+    # Comparisons or assignments with Greek/math names or variables like alpha <= 0.05, p < 0.01
+    re.compile(r"(?<!\$)\b((?:alpha|beta|gamma|delta|sigma|theta|lambda|mu|pi|[A-Za-z])\s*(?:<=|>=|!=|≤|≥|≠|≈|=|<|>)\s*-?\d+(?:\.\d+)?)(?!\$)"),
+]
+
+
+def normalize_math_to_latex(expr: str) -> str:
+    """Convert Unicode math symbols, roots, fractions, and exponents inside an expression to LaTeX."""
+    out = expr.strip()
+    # Handle square root √(x), √x, sqrt(x)
+    out = re.sub(r"(?:√|sqrt)\(([^)]+)\)", r"\\sqrt{\1}", out)
+    out = re.sub(r"√([A-Za-z0-9]+)", r"\\sqrt{\1}", out)
+
+    # ASCII math operators to LaTeX
+    out = out.replace("<=", r" \leq ").replace(">=", r" \geq ").replace("!=", r" \neq ").replace("+-", r" \pm ")
+    out = re.sub(r"\b(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|sigma|omega|Delta|Sigma|Omega)\b", r"\\\1", out)
+
+    for uni_char, latex_cmd in UNICODE_TO_LATEX.items():
+        if uni_char in out:
+            out = out.replace(uni_char, latex_cmd)
+
+    # Convert simple (a+b)/(c+d) fractions
+    out = re.sub(r"\(([^()]+)\)\s*/\s*\(([^()]+)\)", r"\\frac{\1}{\2}", out)
+    # Replace * with \cdot inside equations
+    out = re.sub(r"(?<=[A-Za-z0-9\)\}])\s*\*\s*(?=[A-Za-z0-9\(\\])", r" \\cdot ", out)
+    # Clean redundant spaces
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
+
+
+def is_standalone_equation(line: str) -> bool:
+    """Determine if a single line is predominantly a mathematical equation."""
+    s = line.strip()
+    if not s or len(s) > 180 or s.startswith("#") or s.startswith("|") or s.startswith("!["):
+        return False
+
+    # Already wrapped in LaTeX
+    if (s.startswith("$$") and s.endswith("$$")) or (s.startswith(r"\[") and s.endswith(r"\]")):
+        return False
+
+    # Count natural language words (4+ letters, excluding common math function names)
+    math_words = {"sqrt", "frac", "alfa", "alpha", "beta", "gamma", "delta", "sigma", "theta", "sin", "cos", "tan", "log", "exp", "lim", "max", "min"}
+    alpha_words = [w for w in re.findall(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]{4,}", s) if w.lower() not in math_words]
+
+    # If there are 2 or more normal prose words, it is a text sentence (with possible inline math), not a standalone equation block
+    if len(alpha_words) >= 2:
+        return False
+
+    math_chars = sum(1 for c in s if c in MATH_SYMBOL_SET or c in "=+-*/^_<>()[]{}")
+    has_eq_sign = any(op in s for op in ("=", "<=", ">=", "!=", "≤", "≥", "≠", "≈", "∑", "∫", "√", r"\frac", r"\sum", r"\int"))
+    if has_eq_sign and math_chars >= 2:
+        if "http://" in s or "https://" in s or "://" in s:
+            return False
+        return True
+
+    if sum(1 for c in s if c in MATH_SYMBOL_SET) >= 2 and len(alpha_words) <= 1:
+        return True
+
+    return False
+
+
+def format_line_with_latex(line: str) -> str:
+    """
+    Convert a line of text:
+    - If it's a standalone equation, wrap in display math $$ ... $$
+    - If it's prose containing math symbols or formulas, wrap those segments in inline $ ... $
+    """
+    stripped = line.strip()
+    if not stripped:
+        return ""
+
+    if is_standalone_equation(stripped):
+        # Preserve optional equation numbering like (1) or (2.1) at the end
+        eq_num_match = re.search(r"\s+\((\d+(?:\.\d+)?)\)\s*$", stripped)
+        if eq_num_match:
+            num_tag = eq_num_match.group(1)
+            core_eq = stripped[: eq_num_match.start()].strip()
+            latex_eq = normalize_math_to_latex(core_eq)
+            return f"$$\n{latex_eq} \\tag{{{num_tag}}}\n$$"
+        else:
+            latex_eq = normalize_math_to_latex(stripped)
+            return f"$$\n{latex_eq}\n$$"
+
+    # Inline math replacement for prose lines
+    result = stripped
+    for pat in INLINE_MATH_PATTERNS:
+        result = pat.sub(lambda m: f"${normalize_math_to_latex(m.group(1))}$", result)
+
+    # Replace isolated Unicode math symbols outside $...$ with inline LaTeX
+    if any(ch in result for ch in MATH_SYMBOL_SET):
+        parts = re.split(r"(\$[^$]+\$)", result)
+        new_parts = []
+        for p in parts:
+            if p.startswith("$") and p.endswith("$"):
+                new_parts.append(p)
+            else:
+                # Wrap contiguous math symbol clusters with adjacent variables/numbers
+                p_conv = re.sub(
+                    r"([A-Za-z0-9]*\s*[∑∏∫∮√∂∇∞±∓×÷≤≥≠≈≡∝∈∉⊂⊆∪∩∀∃⇒⇔α-ωΓ-Ω²³¹⁰⁴-⁹₀-₉]+\s*[A-Za-z0-9^_().]*)",
+                    lambda m: f" ${normalize_math_to_latex(m.group(1))}$ ",
+                    p,
+                )
+                new_parts.append(re.sub(r"\s{2,}", " ", p_conv))
+        result = "".join(new_parts).strip()
+
+    return result
+
+
+def format_clean_markdown_table(rows: list) -> str:
+    """
+    Convert a 2D list of rows into a clean, well-aligned Markdown table.
+    - Removes completely empty rows and completely empty columns.
+    - Escapes internal pipe characters (|).
+    - Collapses multi-line cell text cleanly.
+    """
+    if not rows:
+        return ""
+
+    # Clean each cell
+    cleaned_rows = []
+    max_cols = 0
+    for row in rows:
+        if not row:
+            continue
+        clean_r = []
+        for cell in row:
+            txt = str(cell if cell is not None else "").strip()
+            # Collapse internal newlines to <br> if multiple lines, or single space
+            lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+            txt = " <br> ".join(lines) if len(lines) > 1 else (lines[0] if lines else "")
+            txt = re.sub(r"\s{2,}", " ", txt)
+            txt = txt.replace("|", r"\|")
+            clean_r.append(txt)
+        if any(c != "" for c in clean_r):
+            cleaned_rows.append(clean_r)
+            max_cols = max(max_cols, len(clean_r))
+
+    if not cleaned_rows or max_cols == 0:
+        return ""
+
+    # Pad rows to max_cols
+    for r in cleaned_rows:
+        while len(r) < max_cols:
+            r.append("")
+
+    # Filter out columns that are 100% empty across all rows
+    non_empty_col_indices = [
+        c_idx for c_idx in range(max_cols) if any(r[c_idx] != "" for r in cleaned_rows)
+    ]
+    if not non_empty_col_indices:
+        return ""
+
+    final_rows = [[r[c_idx] for c_idx in non_empty_col_indices] for r in cleaned_rows]
+    col_count = len(non_empty_col_indices)
+
+    header = final_rows[0]
+    # Ensure header cells have a fallback name if blank
+    header_fmt = [h if h else f"Col {i+1}" for i, h in enumerate(header)]
+
+    # Compute column widths for clean visual alignment
+    col_widths = [max(len(header_fmt[i]), 3) for i in range(col_count)]
+    for r in final_rows[1:]:
+        for i, cell in enumerate(r):
+            col_widths[i] = min(max(col_widths[i], len(cell)), 60)
+
+    def fmt_row(r_cells):
+        return "| " + " | ".join(c.ljust(col_widths[i]) for i, c in enumerate(r_cells)) + " |"
+
+    lines = [
+        fmt_row(header_fmt),
+        "| " + " | ".join("-" * col_widths[i] for i in range(col_count)) + " |",
+    ]
+    for r in final_rows[1:]:
+        lines.append(fmt_row(r))
+
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# OCR LAYOUT, HEADING, TABLE & LATEX RECONSTRUCTION (FOR SCANNED PDFS & IMAGES)
+# ==============================================================================
+
+def reconstruct_markdown_from_ocr(ocr_result: list) -> str:
+    """
+    Takes RapidOCR result: list of [box_4_pts, text, confidence]
+    and reconstructs:
+    - Headings (# / ## / ###) based on text box height and heading patterns
+    - Clean Markdown tables when multiple boxes share the same vertical row in aligned columns
+    - LaTeX equations ($$ ... $$ and $ ... $)
+    - Clean paragraphs
+    """
+    if not ocr_result:
+        return ""
+
+    items = []
+    heights = []
+    for entry in ocr_result:
+        if not entry or len(entry) < 2:
+            continue
+        box, txt = entry[0], str(entry[1]).strip()
+        if not txt:
+            continue
+        xs = [pt[0] for pt in box]
+        ys = [pt[1] for pt in box]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        h = max(y1 - y0, 1.0)
+        heights.append(h)
+        items.append({
+            "x0": x0, "x1": x1, "y0": y0, "y1": y1,
+            "yc": (y0 + y1) / 2.0, "h": h, "text": txt
+        })
+
+    if not items:
+        return ""
+
+    body_h = median(heights) if heights else 16.0
+    # Sort top-to-bottom
+    items.sort(key=lambda it: (it["yc"], it["x0"]))
+
+    # Group items into horizontal rows based on vertical overlap
+    rows = []
+    current_row = [items[0]]
+    row_yc = items[0]["yc"]
+    row_h = items[0]["h"]
+
+    for it in items[1:]:
+        if abs(it["yc"] - row_yc) <= max(row_h, it["h"]) * 0.55:
+            current_row.append(it)
+            row_yc = sum(x["yc"] for x in current_row) / len(current_row)
+            row_h = max(x["h"] for x in current_row)
+        else:
+            current_row.sort(key=lambda x: x["x0"])
+            rows.append(current_row)
+            current_row = [it]
+            row_yc = it["yc"]
+            row_h = it["h"]
+    if current_row:
+        current_row.sort(key=lambda x: x["x0"])
+        rows.append(current_row)
+
+    # Identify contiguous multi-column table blocks (2+ consecutive rows with >= 2 separated columns)
+    md_blocks = []
+    i = 0
+    n_rows = len(rows)
+
+    while i < n_rows:
+        row = rows[i]
+        if len(row) >= 2:
+            # Check if this starts a table block (at least 2 consecutive multi-cell rows)
+            table_group = [row]
+            j = i + 1
+            while j < n_rows and len(rows[j]) >= 2:
+                table_group.append(rows[j])
+                j += 1
+
+            if len(table_group) >= 2:
+                # Reconstruct column buckets by X center coordinates
+                col_count = max(len(r) for r in table_group)
+                if col_count >= 2:
+                    raw_table = [[cell["text"] for cell in r] for r in table_group]
+                    tbl_md = format_clean_markdown_table(raw_table)
+                    if tbl_md:
+                        md_blocks.append(tbl_md)
+                        i = j
+                        continue
+
+        # Single text line
+        line_text = " ".join(c["text"] for c in row).strip()
+        max_h = max(c["h"] for c in row)
+        h_ratio = max_h / max(body_h, 1.0)
+
+        heading_level = detect_heading_level(line_text, h_ratio, is_bold=(h_ratio >= 1.25))
+        if heading_level > 0:
+            prefix = "#" * heading_level
+            clean_h = re.sub(r"^#+\s*", "", line_text).strip()
+            md_blocks.append(f"{prefix} {clean_h}")
+        else:
+            md_blocks.append(format_line_with_latex(line_text))
+        i += 1
+
+    return "\n\n".join(b for b in md_blocks if b)
+
+
+def ocr_pixmap_or_image_bytes(img_bytes: bytes) -> str:
+    """Run RapidOCR on image bytes and return structured Markdown (headings, tables, LaTeX)."""
+    ocr_engine = get_ocr_engine()
+    if ocr_engine is None:
+        return ""
+    try:
+        result, _ = ocr_engine(img_bytes)
+        if not result:
+            return ""
+        return reconstruct_markdown_from_ocr(result)
+    except Exception:
+        return ""
+
+
+# ==============================================================================
+# HEADING DETECTION & PDF STRUCTURAL PARSER
+# ==============================================================================
+
+HEADING_REGEX_L1 = re.compile(
+    r"^(?:CAP[ÍI]TULO|T[ÍI]TULO|SECCI[ÓO]N|PARTE|ANEXO)\s+[IVXLCDM0-9]+\b", re.IGNORECASE
+)
+HEADING_REGEX_L2 = re.compile(
+    r"^(?:ART[ÍI]CULO\s+\d+|(?:\d{1,2})\.\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúÑñ\s]{2,})"
+)
+HEADING_REGEX_L3 = re.compile(
+    r"^(?:\d{1,2}\.\d{1,2}\.?\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúÑñ\s]{2,}|PAR[ÁA]GRAFO\b)", re.IGNORECASE
+)
+HEADING_REGEX_L4 = re.compile(
+    r"^\d{1,2}\.\d{1,2}\.\d{1,2}\.?\s+\S+"
+)
+
+
+def detect_heading_level(text: str, size_ratio: float, is_bold: bool) -> int:
+    """
+    Determine Markdown heading level (0 = normal text, 2 = ##, 3 = ###, 4 = ####)
+    based on typography (font size ratio vs body median, bold flag) and numbering patterns.
+    """
+    s = text.strip()
+    if not s or len(s) > 160:
+        return 0
+    # Avoid treating equations or table lines as headings
+    if is_standalone_equation(s):
+        return 0
+
+    if HEADING_REGEX_L1.match(s) or size_ratio >= 1.55:
+        return 2
+    if HEADING_REGEX_L2.match(s) or (size_ratio >= 1.28 and is_bold):
+        return 2
+    if HEADING_REGEX_L3.match(s) or size_ratio >= 1.18 or (size_ratio >= 1.10 and is_bold and len(s) < 95):
+        return 3
+    if HEADING_REGEX_L4.match(s) or (is_bold and len(s) < 75 and s.isupper() and len(s) > 3):
+        return 4
+    return 0
+
+
+def extract_structured_page_elements(page, body_font_size: float, enable_ocr: bool = True) -> tuple:
+    """
+    Extract all elements from a PyMuPDF page in reading order (y0):
+    - Headings (#, ##, ###, ####) from font sizes, bold flags, and structural patterns
+    - Clean Markdown tables placed at their exact vertical position
+    - Mathematical equations formatted in LaTeX ($$ ... $$ and $ ... $)
+    - Superscripts/subscripts from span flags
+    - Automatic RapidOCR fallback if the page is scanned or image-based
+    Returns (markdown_text, used_ocr_bool)
+    """
+    elements = []  # list of (y0, x0, markdown_string)
+
+    # 1. Extract tables with bounding boxes
+    table_rects = []
+    try:
+        tabs = page.find_tables()
+        if tabs and tabs.tables:
+            for tab in tabs.tables:
+                rect = pymupdf.Rect(tab.bbox)
+                table_rects.append(rect)
+                extracted = tab.extract()
+                if extracted:
+                    clean_tbl = format_clean_markdown_table(extracted)
+                    if clean_tbl:
+                        elements.append((rect.y0, rect.x0, clean_tbl))
+    except Exception:
+        pass
+
+    # 2. Extract rich text spans (excluding table bounding boxes)
+    text_dict = page.get_text("dict")
+    digital_char_count = 0
+
+    for block in text_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        b_rect = pymupdf.Rect(block["bbox"])
+        # Skip block if its center lies inside a detected table
+        b_center = pymupdf.Point((b_rect.x0 + b_rect.x1) / 2, (b_rect.y0 + b_rect.y1) / 2)
+        if any( b_center in tr or (b_rect.intersects(tr) and (b_rect & tr).get_area() / max(b_rect.get_area(), 1) > 0.5) for tr in table_rects):
+            continue
+
+        block_lines_out = []
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+
+            line_parts = []
+            max_span_size = 0.0
+            bold_chars = 0
+            total_chars = 0
+
+            for sp in spans:
+                raw_txt = sp.get("text", "")
+                if not raw_txt.strip():
+                    line_parts.append(raw_txt)
+                    continue
+
+                sz = float(sp.get("size", body_font_size) or body_font_size)
+                flags = int(sp.get("flags", 0))
+                font_name = (sp.get("font") or "").lower()
+                is_sup = bool(flags & 1)  # superscript bit in PyMuPDF
+                is_italic = bool(flags & 2) or "italic" in font_name or "oblique" in font_name
+                is_bold = bool(flags & 16) or "bold" in font_name or "black" in font_name
+
+                max_span_size = max(max_span_size, sz)
+                c_len = len(raw_txt.strip())
+                total_chars += c_len
+                if is_bold:
+                    bold_chars += c_len
+
+                if is_sup and len(raw_txt.strip()) <= 6:
+                    line_parts.append(f"^{{{raw_txt.strip()}}}")
+                else:
+                    line_parts.append(raw_txt)
+
+            full_line = "".join(line_parts).strip()
+            if not full_line:
+                continue
+
+            digital_char_count += len(full_line)
+            line_is_bold = (bold_chars / max(total_chars, 1)) >= 0.6
+            size_ratio = max_span_size / max(body_font_size, 1.0)
+
+            h_level = detect_heading_level(full_line, size_ratio, line_is_bold)
+            if h_level > 0:
+                clean_title = re.sub(r"^#+\s*", "", full_line).strip()
+                block_lines_out.append(f"\n{'#' * h_level} {clean_title}\n")
+            else:
+                # Bullet list normalization
+                if full_line.startswith(("•", "●", "▪", "‣", "– ")):
+                    bullet_body = full_line.lstrip("•●▪‣– ").strip()
+                    block_lines_out.append(f"- {format_line_with_latex(bullet_body)}")
+                else:
+                    block_lines_out.append(format_line_with_latex(full_line))
+
+        if block_lines_out:
+            # Join lines inside the same paragraph block intelligently
+            merged_block = []
+            for ln in block_lines_out:
+                if ln.startswith("\n#") or ln.startswith("$$") or ln.startswith("- "):
+                    merged_block.append(ln.strip())
+                elif merged_block and not merged_block[-1].startswith("#") and not merged_block[-1].startswith("$$") and not merged_block[-1].startswith("- "):
+                    merged_block[-1] = merged_block[-1] + " " + ln
+                else:
+                    merged_block.append(ln)
+            elements.append((b_rect.y0, b_rect.x0, "\n\n".join(merged_block)))
+
+    # 3. Check if page is scanned (very few digital characters and contains images) -> Run RapidOCR!
+    used_ocr = False
+    if digital_char_count < 25 and not elements:
+        imgs = page.get_images()
+        if enable_ocr and (imgs or digital_char_count == 0):
+            try:
+                pix = page.get_pixmap(dpi=175)
+                png_bytes = pix.tobytes("png")
+                ocr_md = ocr_pixmap_or_image_bytes(png_bytes)
+                if ocr_md.strip():
+                    used_ocr = True
+                    return ocr_md, True
+            except Exception:
+                pass
+        if imgs:
+            return f"*[Página escaneada ({len(imgs)} imágenes detectadas — sin texto reconocible)]*", False
+        return "*[Página vacía]*", False
+
+    # Sort all extracted text blocks and tables in natural top-to-bottom reading order
+    elements.sort(key=lambda el: (round(el[0], 1), round(el[1], 1)))
+    page_md = "\n\n".join(el[2] for el in elements if el[2].strip())
+    return page_md, used_ocr
 
 
 # ==============================================================================
@@ -46,11 +588,11 @@ except ImportError:
 # ==============================================================================
 
 CATEGORY_LABELS = {
-    "pdf": "📄 PDF (Texto + Tablas)",
+    "pdf": "📄 PDF (Encabezados + Tablas + LaTeX + OCR)",
     "excel": "📊 Excel (.xlsx / .xls / .csv)",
-    "word": "📝 Word (.docx / .doc)",
+    "word": "📝 Word (.docx / .doc + Ecuaciones)",
     "pptx": "📽️ PowerPoint (.pptx)",
-    "image": "🖼️ Imágenes (PNG/JPG + Meta)",
+    "image": "🖼️ Imágenes (PNG/JPG + OCR + LaTeX)",
     "other": "🧾 Texto / JSON / XML / Otros",
 }
 
@@ -65,7 +607,8 @@ CODE_LANG_MAP = {
     ".py": "python", ".js": "javascript", ".ts": "typescript",
     ".json": "json", ".xml": "xml", ".html": "html", ".htm": "html",
     ".css": "css", ".sql": "sql", ".yaml": "yaml", ".yml": "yaml",
-    ".sh": "bash", ".bat": "bat", ".ps1": "powershell", ".md": "markdown"
+    ".sh": "bash", ".bat": "bat", ".ps1": "powershell", ".md": "markdown",
+    ".tex": "latex"
 }
 
 
@@ -102,7 +645,28 @@ def sanitize_filename(name: str) -> str:
     return clean if clean else "archivo"
 
 
-def convert_pdf_to_md(pdf_data: bytes, title: str) -> str:
+def estimate_pdf_body_font_size(doc) -> float:
+    """Compute the median font size of body text across the PDF document."""
+    sizes = []
+    sample_pages = min(len(doc), 8)
+    for pno in range(sample_pages):
+        try:
+            tdict = doc[pno].get_text("dict")
+            for b in tdict.get("blocks", []):
+                if b.get("type") != 0:
+                    continue
+                for ln in b.get("lines", []):
+                    for sp in ln.get("spans", []):
+                        txt = sp.get("text", "").strip()
+                        sz = float(sp.get("size", 0) or 0)
+                        if len(txt) >= 3 and 5.0 <= sz <= 36.0:
+                            sizes.extend([sz] * min(len(txt), 30))
+        except Exception:
+            pass
+    return median(sizes) if sizes else 11.0
+
+
+def convert_pdf_to_md(pdf_data: bytes, title: str, enable_ocr: bool = True) -> str:
     if pymupdf is None:
         return f"# {title}\n\n> PyMuPDF no está disponible para extraer este PDF.\n"
     try:
@@ -110,6 +674,7 @@ def convert_pdf_to_md(pdf_data: bytes, title: str) -> str:
     except Exception as e:
         return f"# {title}\n\n> Error al abrir PDF: {e}\n"
 
+    body_font_size = estimate_pdf_body_font_size(doc)
     md_parts = [f"# {title}\n"]
     meta = doc.metadata or {}
     info_lines = [f"- **Páginas**: {len(doc)}"]
@@ -119,61 +684,45 @@ def convert_pdf_to_md(pdf_data: bytes, title: str) -> str:
         info_lines.append(f"- **Título original**: {meta.get('title')}")
     if meta.get("creationDate"):
         info_lines.append(f"- **Fecha Creación**: {meta.get('creationDate')}")
-    md_parts.append("\n".join(info_lines) + "\n\n---\n")
 
+    ocr_pages_count = 0
+    page_outputs = []
     for page_idx, page in enumerate(doc):
-        md_parts.append(f"\n## Página {page_idx + 1}\n\n")
-        table_rects = []
-        tables_md = []
-        try:
-            tabs = page.find_tables()
-            if tabs and tabs.tables:
-                for tab in tabs.tables:
-                    table_rects.append(tab.bbox)
-                    extracted = tab.extract()
-                    if extracted and len(extracted) > 0:
-                        header = extracted[0]
-                        clean_header = [str(c or "").replace("\n", " ").strip() for c in header]
-                        col_count = max(len(clean_header), 1)
-                        t_md = [
-                            "| " + " | ".join(clean_header) + " |",
-                            "| " + " | ".join(["---"] * col_count) + " |",
-                        ]
-                        for row in extracted[1:]:
-                            clean_row = [str(c or "").replace("\n", " ").strip() for c in row]
-                            while len(clean_row) < col_count:
-                                clean_row.append("")
-                            t_md.append("| " + " | ".join(clean_row[:col_count]) + " |")
-                        tables_md.append("\n".join(t_md))
-        except Exception:
-            pass
+        page_md, used_ocr = extract_structured_page_elements(page, body_font_size, enable_ocr=enable_ocr)
+        if used_ocr:
+            ocr_pages_count += 1
+        tag = " *(OCR)*" if used_ocr else ""
+        page_outputs.append(f"\n## Página {page_idx + 1}{tag}\n\n{page_md}\n")
 
-        blocks = page.get_text("blocks")
-        page_has_text = False
-        for b in blocks:
-            r = pymupdf.Rect(b[:4])
-            in_tab = any(r.intersects(pymupdf.Rect(tr)) for tr in table_rects)
-            if not in_tab:
-                txt = b[4].strip()
-                if txt:
-                    page_has_text = True
-                    md_parts.append(txt + "\n\n")
+    if ocr_pages_count > 0:
+        info_lines.append(f"- **Páginas procesadas con OCR**: {ocr_pages_count}")
 
-        for tmd in tables_md:
-            md_parts.append(tmd + "\n\n")
-            page_has_text = True
-
-        if not page_has_text:
-            imgs = page.get_images()
-            if imgs:
-                md_parts.append(
-                    f"*[Página gráfica o escaneada ({len(imgs)} imágenes detectadas sin texto seleccionable)]*\n\n"
-                )
-            else:
-                md_parts.append("*[Página vacía]*\n\n")
+    md_parts.append("\n".join(info_lines) + "\n\n---\n")
+    md_parts.extend(page_outputs)
 
     doc.close()
     return "".join(md_parts)
+
+
+def extract_docx_omml_math(para_element) -> list:
+    """Extract Office MathML (m:oMath) text nodes from a Word paragraph XML element and convert to LaTeX."""
+    equations = []
+    try:
+        for node in para_element.iter():
+            tag = node.tag.split("}")[-1] if "}" in node.tag else node.tag
+            if tag == "oMath":
+                tokens = []
+                for sub in node.iter():
+                    sub_tag = sub.tag.split("}")[-1] if "}" in sub.tag else sub.tag
+                    if sub_tag == "t" and sub.text:
+                        tokens.append(sub.text)
+                if tokens:
+                    raw_eq = "".join(tokens).strip()
+                    if raw_eq:
+                        equations.append(normalize_math_to_latex(raw_eq))
+    except Exception:
+        pass
+    return equations
 
 
 def convert_docx_to_md(docx_data: bytes, title: str) -> str:
@@ -198,8 +747,11 @@ def convert_docx_to_md(docx_data: bytes, title: str) -> str:
 
     for para in document.paragraphs:
         txt = para.text.strip()
-        if not txt:
+        omml_eqs = extract_docx_omml_math(para._element)
+
+        if not txt and not omml_eqs:
             continue
+
         style_name = (para.style.name or "").lower() if para.style else ""
         if "heading 1" in style_name or "título 1" in style_name:
             md_parts.append(f"## {txt}\n\n")
@@ -207,28 +759,26 @@ def convert_docx_to_md(docx_data: bytes, title: str) -> str:
             md_parts.append(f"### {txt}\n\n")
         elif "heading 3" in style_name or "título 3" in style_name:
             md_parts.append(f"#### {txt}\n\n")
+        elif "heading 4" in style_name or "título 4" in style_name:
+            md_parts.append(f"##### {txt}\n\n")
         elif "list" in style_name or "viñeta" in style_name:
-            md_parts.append(f"- {txt}\n")
+            md_parts.append(f"- {format_line_with_latex(txt)}\n")
         else:
-            md_parts.append(f"{txt}\n\n")
+            if txt:
+                md_parts.append(f"{format_line_with_latex(txt)}\n\n")
+
+        for eq in omml_eqs:
+            md_parts.append(f"$$\n{eq}\n$$\n\n")
 
     if document.tables:
         md_parts.append("\n## Tablas del Documento\n\n")
         for idx, table in enumerate(document.tables, 1):
             rows_data = []
             for row in table.rows:
-                rows_data.append([c.text.strip().replace("\n", " ") for c in row.cells])
-            if rows_data:
-                col_count = max(len(r) for r in rows_data)
-                if col_count > 0:
-                    md_parts.append(f"### Tabla {idx}\n\n")
-                    header = rows_data[0] + [""] * (col_count - len(rows_data[0]))
-                    md_parts.append("| " + " | ".join(header) + " |\n")
-                    md_parts.append("| " + " | ".join(["---"] * col_count) + " |\n")
-                    for r in rows_data[1:]:
-                        padded = r + [""] * (col_count - len(r))
-                        md_parts.append("| " + " | ".join(padded[:col_count]) + " |\n")
-                    md_parts.append("\n")
+                rows_data.append([c.text.strip() for c in row.cells])
+            clean_tbl = format_clean_markdown_table(rows_data)
+            if clean_tbl:
+                md_parts.append(f"### Tabla {idx}\n\n{clean_tbl}\n\n")
 
     return "".join(md_parts)
 
@@ -258,10 +808,8 @@ def convert_excel_or_csv_to_md(data: bytes, title: str, ext: str) -> str:
         if rows == 0:
             md_parts.append("*[Archivo sin filas de datos]*\n")
         else:
-            try:
-                md_parts.append(df.fillna("").to_markdown(index=False) + "\n")
-            except Exception as e:
-                md_parts.append(f"> Error al formatear tabla: {e}\n")
+            raw_rows = [list(df.columns)] + df.fillna("").values.tolist()
+            md_parts.append(format_clean_markdown_table(raw_rows) + "\n")
         return "".join(md_parts)
 
     try:
@@ -282,8 +830,9 @@ def convert_excel_or_csv_to_md(data: bytes, title: str, ext: str) -> str:
             md_parts.append("*[Hoja vacía]*\n\n")
             continue
         try:
-            tbl_md = df.fillna("").to_markdown(index=False)
-            md_parts.append(tbl_md + "\n\n")
+            raw_rows = [list(df.columns)] + df.fillna("").values.tolist()
+            tbl_md = format_clean_markdown_table(raw_rows)
+            md_parts.append((tbl_md if tbl_md else "*[Hoja sin datos válidos]*") + "\n\n")
         except Exception as e:
             md_parts.append(f"> Error al formatear la hoja '{sheet_name}': {e}\n\n")
 
@@ -307,18 +856,15 @@ def convert_pptx_to_md(pptx_data: bytes, title: str) -> str:
         slide_texts = []
         for shape in slide.shapes:
             if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
-                txt = shape.text_frame.text.strip()
-                if txt:
-                    slide_texts.append(txt)
+                for para in shape.text_frame.paragraphs:
+                    txt = para.text.strip()
+                    if txt:
+                        slide_texts.append(format_line_with_latex(txt))
             elif getattr(shape, "has_table", False) and shape.has_table:
-                table_md = []
-                for row in shape.table.rows:
-                    cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-                    table_md.append("| " + " | ".join(cells) + " |")
-                if table_md:
-                    sep = "| " + " | ".join(["---"] * len(shape.table.columns)) + " |"
-                    table_md.insert(1, sep)
-                    slide_texts.append("\n".join(table_md))
+                raw_rows = [[c.text.strip() for c in row.cells] for row in shape.table.rows]
+                clean_tbl = format_clean_markdown_table(raw_rows)
+                if clean_tbl:
+                    slide_texts.append(clean_tbl)
 
         if slide_texts:
             for st in slide_texts:
@@ -337,7 +883,7 @@ def convert_pptx_to_md(pptx_data: bytes, title: str) -> str:
     return "".join(md_parts)
 
 
-def convert_image_to_md(img_data: bytes, title: str, ext: str) -> str:
+def convert_image_to_md(img_data: bytes, title: str, ext: str, enable_ocr: bool = True) -> str:
     ext_clean = ext.lstrip(".").upper() or "IMG"
     md_parts = [
         f"# {title}\n\n",
@@ -353,7 +899,15 @@ def convert_image_to_md(img_data: bytes, title: str, ext: str) -> str:
                     md_parts.append(f"- **DPI**: {im.info.get('dpi')}\n")
         except Exception:
             pass
+
     md_parts.append(f"\n![{title}]({title}{ext})\n")
+
+    if enable_ocr:
+        ocr_md = ocr_pixmap_or_image_bytes(img_data)
+        if ocr_md.strip():
+            md_parts.append("\n---\n\n## Texto y Ecuaciones Extraídas por OCR\n\n")
+            md_parts.append(ocr_md + "\n")
+
     return "".join(md_parts)
 
 
@@ -403,7 +957,6 @@ def convert_generic_binary_to_md(data: bytes, title: str, ext: str, note: str = 
         md_parts.append(f"- **Nota**: {note}\n")
     md_parts.append("\n---\n\n")
 
-    # Attempt printable strings extraction (useful for legacy .doc, binary logs, etc.)
     try:
         text_latin = data.decode("latin-1", errors="ignore")
         matches = re.findall(r"[A-Za-z0-9ÁÉÍÓÚáéíóúÑñ ,.;:\-_/()\[\]{}@#$%&*+=?!]{8,}", text_latin)
@@ -429,12 +982,12 @@ def convert_generic_binary_to_md(data: bytes, title: str, ext: str, note: str = 
     return "".join(md_parts)
 
 
-def convert_bytes_to_markdown(data: bytes, original_name: str) -> str:
+def convert_bytes_to_markdown(data: bytes, original_name: str, enable_ocr: bool = True) -> str:
     base_name, ext = os.path.splitext(original_name)
     ext_lower = ext.lower()
 
     if ext_lower == ".pdf":
-        return convert_pdf_to_md(data, title=base_name)
+        return convert_pdf_to_md(data, title=base_name, enable_ocr=enable_ocr)
     elif ext_lower in (".xlsx", ".xls", ".xlsm", ".csv", ".tsv"):
         return convert_excel_or_csv_to_md(data, title=base_name, ext=ext_lower)
     elif ext_lower == ".docx":
@@ -444,7 +997,7 @@ def convert_bytes_to_markdown(data: bytes, original_name: str) -> str:
     elif ext_lower in (".pptx", ".ppt"):
         return convert_pptx_to_md(data, title=base_name)
     elif ext_lower in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff", ".ico"):
-        return convert_image_to_md(data, title=base_name, ext=ext_lower)
+        return convert_image_to_md(data, title=base_name, ext=ext_lower, enable_ocr=enable_ocr)
     elif ext_lower in TEXT_EXTENSIONS:
         return convert_text_to_md(data, title=base_name, ext=ext_lower)
     else:
@@ -461,7 +1014,6 @@ def scan_zip_bytes(zip_bytes: bytes, zip_display_chain: str, target_base_dir: st
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
             zip_subfolders_set = set()
-            zip_files_count = 0
 
             for info in zf.infolist():
                 inner_path = info.filename.replace("\\", "/").strip("/")
@@ -472,7 +1024,6 @@ def scan_zip_bytes(zip_bytes: bytes, zip_display_chain: str, target_base_dir: st
                     zip_subfolders_set.add(inner_path)
                     continue
 
-                # Track parent folders inside the zip
                 parts = inner_path.split("/")
                 if len(parts) > 1:
                     for i in range(1, len(parts)):
@@ -509,7 +1060,6 @@ def scan_zip_bytes(zip_bytes: bytes, zip_display_chain: str, target_base_dir: st
                     except Exception as e:
                         scan_result["corrupt_zips"].append((f"{zip_display_chain}::{inner_path}", str(e)))
                 else:
-                    zip_files_count += 1
                     scan_result["zip_files"] += 1
                     cat = classify_extension(ext)
                     scan_result["categories"][cat] += 1
@@ -519,7 +1069,6 @@ def scan_zip_bytes(zip_bytes: bytes, zip_display_chain: str, target_base_dir: st
                     inner_base, _ = os.path.splitext(clean_inner)
                     target_md = os.path.join(target_base_dir, inner_base + ".md")
 
-                    # Read bytes laziness vs nested: store zip chain or bytes if nested
                     scan_result["tasks"].append({
                         "type": "zip_stream" if "::" in zip_display_chain else "zip_disk",
                         "zip_source": zip_display_chain,
@@ -587,7 +1136,6 @@ def scan_directory_recursive(source_dir: str, target_dir: str, explore_zips: boo
 
         clean_rel_dir = sanitize_relpath(rel_dir) if preserve_structure else ""
 
-        # Attach folder node in tree preview
         if rel_dir != "":
             parent_rel = os.path.dirname(rel_dir)
             if parent_rel == ".":
@@ -679,7 +1227,7 @@ def scan_directory_recursive(source_dir: str, target_dir: str, explore_zips: boo
     return scan_result
 
 
-def execute_conversion_task(task: dict) -> dict:
+def execute_conversion_task(task: dict, enable_ocr: bool = True) -> dict:
     """Worker function to convert a single file task (direct or inside ZIP)."""
     target_md = task["target_md"]
     orig_name = task["original_name"]
@@ -695,7 +1243,7 @@ def execute_conversion_task(task: dict) -> dict:
         else:
             data = task["raw_bytes"]
 
-        md_content = convert_bytes_to_markdown(data, orig_name)
+        md_content = convert_bytes_to_markdown(data, orig_name, enable_ocr=enable_ocr)
 
         os.makedirs(os.path.dirname(target_md), exist_ok=True)
         with open(target_md, "w", encoding="utf-8", errors="replace") as out_f:
@@ -734,11 +1282,10 @@ class MarkdownConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Convertidor Universal a Markdown — Daniel Contreras")
-        self.geometry("980x680")
-        self.minsize(880, 620)
+        self.geometry("1020x690")
+        self.minsize(900, 620)
         self.configure(bg="#0f172a")
 
-        # Color Palette matching Approved Design #1
         self.colors = {
             "bg": "#0f172a",
             "card": "#1e293b",
@@ -753,7 +1300,6 @@ class MarkdownConverterApp(tk.Tk):
             "console_bg": "#090d16",
         }
 
-        # State variables
         default_src = r"C:\Users\danie\Downloads\Monitoreo"
         if not os.path.isdir(default_src):
             default_src = r"C:\Users\danie\Downloads\Mapeo"
@@ -761,6 +1307,7 @@ class MarkdownConverterApp(tk.Tk):
         self.dst_dir_var = tk.StringVar(value=default_src + "_MD")
         self.explore_zips_var = tk.BooleanVar(value=True)
         self.preserve_struct_var = tk.BooleanVar(value=True)
+        self.enable_ocr_var = tk.BooleanVar(value=True)
         self.generate_report_var = tk.BooleanVar(value=True)
         self.workers_var = tk.IntVar(value=12)
 
@@ -771,7 +1318,6 @@ class MarkdownConverterApp(tk.Tk):
         self._configure_ttk_styles()
         self._build_ui()
 
-        # Perform initial scan automatically after window opens
         self.after(250, self.start_scan)
 
     def _configure_ttk_styles(self):
@@ -806,13 +1352,10 @@ class MarkdownConverterApp(tk.Tk):
         )
 
     def _build_ui(self):
-        # Main container
         self.main_wrap = tk.Frame(self, bg=self.colors["bg"], padx=18, pady=14)
         self.main_wrap.pack(fill="both", expand=True)
 
-        # ------------------------------------------------------------------
         # 1. HEADER & TAB SWITCHER
-        # ------------------------------------------------------------------
         header = tk.Frame(self.main_wrap, bg=self.colors["bg"])
         header.pack(fill="x", pady=(0, 10))
 
@@ -840,16 +1383,16 @@ class MarkdownConverterApp(tk.Tk):
             font=("Segoe UI", 13, "bold"),
             anchor="w",
         ).pack(anchor="w")
+        ocr_status = "RapidOCR + LaTeX Activo" if RapidOCR is not None else "Modo Estándar + LaTeX"
         tk.Label(
             title_texts,
-            text="Aplicación de Escritorio · Escaneo Recursivo de Subcarpetas + Archivos .ZIP",
+            text=f"Escaneo Recursivo + Archivos .ZIP · Encabezados, Tablas Limpias, Ecuaciones LaTeX y OCR ({ocr_status})",
             bg=self.colors["bg"],
             fg=self.colors["muted"],
             font=("Segoe UI", 9),
             anchor="w",
         ).pack(anchor="w")
 
-        # Tab buttons on the right
         tab_bar = tk.Frame(
             header,
             bg=self.colors["card"],
@@ -881,18 +1424,14 @@ class MarkdownConverterApp(tk.Tk):
             btn.pack(side="left", padx=2)
             self.tab_buttons[key] = btn
 
-        # Divider
         tk.Frame(self.main_wrap, bg=self.colors["card_border"], height=1).pack(fill="x", pady=(0, 12))
 
-        # ------------------------------------------------------------------
-        # 2. FOLDER PICKERS BAR (SOURCE & DESTINATION)
-        # ------------------------------------------------------------------
+        # 2. FOLDER PICKERS BAR
         folders_frame = tk.Frame(self.main_wrap, bg=self.colors["bg"])
         folders_frame.pack(fill="x", pady=(0, 10))
         folders_frame.columnconfigure(0, weight=1)
         folders_frame.columnconfigure(1, weight=1)
 
-        # Source Card
         src_card = tk.Frame(
             folders_frame,
             bg=self.colors["card"],
@@ -938,7 +1477,6 @@ class MarkdownConverterApp(tk.Tk):
             command=self.choose_source_folder,
         ).pack(side="right", padx=(8, 0))
 
-        # Destination Card
         dst_card = tk.Frame(
             folders_frame,
             bg=self.colors["card"],
@@ -986,9 +1524,7 @@ class MarkdownConverterApp(tk.Tk):
             command=self.choose_dest_folder,
         ).pack(side="left")
 
-        # ------------------------------------------------------------------
-        # 3. 4 KPI COUNTER CARDS (ALWAYS VISIBLE)
-        # ------------------------------------------------------------------
+        # 3. 4 KPI COUNTER CARDS
         kpi_frame = tk.Frame(self.main_wrap, bg=self.colors["bg"])
         kpi_frame.pack(fill="x", pady=(0, 12))
         for i in range(4):
@@ -1007,9 +1543,7 @@ class MarkdownConverterApp(tk.Tk):
             kpi_frame, 3, "Formatos Detectados", "0 tipos", "PDF, DOCX, XLSX, PPTX…"
         )
 
-        # ------------------------------------------------------------------
-        # 4. SWITCHABLE CONTENT VIEWS (SCAN / TREE / RUN)
-        # ------------------------------------------------------------------
+        # 4. SWITCHABLE CONTENT VIEWS
         self.views_container = tk.Frame(self.main_wrap, bg=self.colors["bg"])
         self.views_container.pack(fill="both", expand=True)
 
@@ -1021,9 +1555,7 @@ class MarkdownConverterApp(tk.Tk):
         self._build_view_tree()
         self._build_view_run()
 
-        # ------------------------------------------------------------------
         # 5. FOOTER WITH STATUS AND AUTHOR SIGNATURE (BOTTOM-RIGHT CORNER)
-        # ------------------------------------------------------------------
         tk.Frame(self.main_wrap, bg=self.colors["card_border"], height=1).pack(fill="x", pady=(10, 8))
         footer = tk.Frame(self.main_wrap, bg=self.colors["bg"])
         footer.pack(fill="x", side="bottom")
@@ -1049,7 +1581,6 @@ class MarkdownConverterApp(tk.Tk):
         )
         self.status_text.pack(side="left")
 
-        # Author Signature in Bottom-Right Corner
         author_right = tk.Frame(footer, bg=self.colors["bg"])
         author_right.pack(side="right")
 
@@ -1184,7 +1715,6 @@ class MarkdownConverterApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
         ).pack(side="left", padx=(4, 0))
 
-        # 6 Format Breakdown Boxes (2x3 grid)
         grid = tk.Frame(card, bg=self.colors["card"])
         grid.pack(fill="x", pady=(4, 12))
         for c in range(3):
@@ -1221,7 +1751,6 @@ class MarkdownConverterApp(tk.Tk):
             cnt_lbl.pack(side="right")
             self.cat_count_labels[ckey] = cnt_lbl
 
-        # Options + Start Button bar
         controls_bar = tk.Frame(self.view_scan, bg=self.colors["bg"], pady=10)
         controls_bar.pack(fill="x")
 
@@ -1238,11 +1767,11 @@ class MarkdownConverterApp(tk.Tk):
         }
         tk.Checkbutton(
             opts_left,
-            text="Explorar dentro de .ZIP (y ZIPs anidados)",
+            text="Explorar .ZIP (y anidados)",
             variable=self.explore_zips_var,
             command=self.start_scan,
             **cb_style,
-        ).pack(side="left", padx=(0, 12))
+        ).pack(side="left", padx=(0, 10))
 
         tk.Checkbutton(
             opts_left,
@@ -1250,7 +1779,14 @@ class MarkdownConverterApp(tk.Tk):
             variable=self.preserve_struct_var,
             command=self.start_scan,
             **cb_style,
-        ).pack(side="left", padx=(0, 12))
+        ).pack(side="left", padx=(0, 10))
+
+        tk.Checkbutton(
+            opts_left,
+            text="OCR + Ecuaciones LaTeX",
+            variable=self.enable_ocr_var,
+            **cb_style,
+        ).pack(side="left", padx=(0, 10))
 
         tk.Checkbutton(
             opts_left,
@@ -1378,7 +1914,6 @@ class MarkdownConverterApp(tk.Tk):
         )
         self.progress_bar.pack(fill="x", pady=(0, 10))
 
-        # Console Output
         console_wrap = tk.Frame(
             card,
             bg=self.colors["console_bg"],
@@ -1403,7 +1938,6 @@ class MarkdownConverterApp(tk.Tk):
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
 
-        # Bottom Actions in Run View
         run_actions = tk.Frame(self.view_run, bg=self.colors["bg"], pady=8)
         run_actions.pack(fill="x")
 
@@ -1435,9 +1969,6 @@ class MarkdownConverterApp(tk.Tk):
             command=self.open_destination_folder,
         ).pack(side="right")
 
-    # ------------------------------------------------------------------
-    # INTERACTION & WORKFLOW METHODS
-    # ------------------------------------------------------------------
     def switch_tab(self, tab_key: str):
         for k, btn in self.tab_buttons.items():
             if k == tab_key:
@@ -1525,7 +2056,6 @@ class MarkdownConverterApp(tk.Tk):
         total_zips = res["zip_count"]
         num_exts = len(res["extensions"])
 
-        # Update 4 KPI Cards
         self.kpi_files_val.configure(text=f"{total_files:,}")
         self.kpi_files_sub.configure(text=f"{res['direct_files']:,} directos · {res['zip_files']:,} en ZIP")
 
@@ -1541,13 +2071,11 @@ class MarkdownConverterApp(tk.Tk):
         sample_exts = ", ".join(sorted(e.upper().lstrip(".") for e in list(res["extensions"])[:5]))
         self.kpi_types_sub.configure(text=sample_exts if sample_exts else "Ningún archivo")
 
-        # Update 6 Format Breakdown counters
         for ckey, lbl in self.cat_count_labels.items():
             lbl.configure(text=f"{res['categories'].get(ckey, 0):,}")
 
         self.start_btn.configure(text=f"Iniciar Conversión ({total_files:,} archivos) →")
 
-        # Populate Treeview
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -1599,10 +2127,12 @@ class MarkdownConverterApp(tk.Tk):
         src_dir = self.src_dir_var.get()
         dst_dir = self.dst_dir_var.get()
         max_workers = max(1, int(self.workers_var.get()))
+        enable_ocr = self.enable_ocr_var.get()
 
         self.append_log(f"=== INICIANDO CONVERSIÓN UNIVERSAL A MARKDOWN ===")
         self.append_log(f"Origen:  {src_dir}")
         self.append_log(f"Destino: {dst_dir}")
+        self.append_log(f"OCR + LaTeX: {'ACTIVO' if enable_ocr else 'DESACTIVADO'}")
         self.append_log(f"Total archivos a convertir: {total_tasks:,} (Hilos: {max_workers})\n")
         self.set_status(f"Convirtiendo {total_tasks:,} archivos a Markdown...", self.colors["primary"])
 
@@ -1614,7 +2144,7 @@ class MarkdownConverterApp(tk.Tk):
             errors_list = []
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(execute_conversion_task, t): t for t in tasks}
+                futures = {executor.submit(execute_conversion_task, t, enable_ocr): t for t in tasks}
                 for fut in as_completed(futures):
                     if self.cancel_requested:
                         executor.shutdown(wait=False, cancel_futures=True)
@@ -1638,7 +2168,6 @@ class MarkdownConverterApp(tk.Tk):
                     rem = (total_tasks - completed) / rate if rate > 0 else 0
                     pct = (completed / total_tasks) * 100
 
-                    # Throttle UI updates for large batches
                     if completed <= 30 or completed % max(1, total_tasks // 100) == 0 or completed == total_tasks or st == "ERROR":
                         self.after(
                             0,
